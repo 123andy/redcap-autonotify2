@@ -3,7 +3,7 @@
 /**
  * Autonotify plugin by Andy Martin, Stanford University
  *
- * Substantially revised on 2016-03-01 to support saving to the log and additoinal features
+ * Substantially revised on 2016-03-01 to support saving to the log and additional features
  */
 
 error_reporting(E_ALL);
@@ -39,6 +39,9 @@ class AutoNotify {
         if (REDCap::isLongitudinal()) {
             $events = REDCap::getEventNames(true,false);
             $this->event_id = array_search($this->redcap_event_name, $events);
+        } else {
+            global $Proj;
+            $this->event_id = $Proj->firstEventId;
         }
         $this->redcap_data_access_group = voefr('redcap_data_access_group');
         $this->instrument_complete = voefr($this->instrument.'_complete');
@@ -51,8 +54,9 @@ class AutoNotify {
 
         global $data_entry_trigger_url;
         $det_qs = parse_url($data_entry_trigger_url, PHP_URL_QUERY);
+
         parse_str($det_qs,$params);
-        if (isset($params['an'])) {
+        if (!empty($params['an'])) {
             // Step 1:  We have identified an old DET-based config
             logIt("Updating older DET url: $data_entry_trigger_url", "DEBUG");
             $an = $params['an'];
@@ -138,7 +142,7 @@ class AutoNotify {
             }
 
             if (empty($title)) {
-                logIt("Cannot process an alert with an empty title: " . json_encode($trigger),"ERROR");
+                logIt("Cannot process alert $i because it has an empty title: " . json_encode($trigger),"ERROR");
                 continue;
             }
 
@@ -153,16 +157,16 @@ class AutoNotify {
                         logIt("{$this->record}: Notified ($title) / " . ($result ? 'Success' : 'Failure') );
                     } else {
                         // Already notified
-                        logIt("{$this->record}: Already notified ($title)");
+                        logIt("{$this->record}: [$title] - Already notified");
                     }
                 } else {
                     // Logic did not pass
-                    logIt("Logic: $logic / Record: " . $this->record . " / Project: " . $this->project_id, "DEBUG");
-                    logIt("{$this->record}: Logic test failed ($title)");
+                    //logIt("Logic: $logic / Record: " . $this->record . " / Project: " . $this->project_id, "DEBUG");
+                    logIt("{$this->record}: [$title] - Logic false");
                 }
             } else {
                 // object missing logic or record
-                logIt("{$this->record}: Unable to execute: missing logic or record ($title)");
+                logIt("{$this->record}: [$title] - Unable to execute: missing logic or record");
             }
         }
 
@@ -242,6 +246,7 @@ class AutoNotify {
         global $data_entry_trigger_url;
         $det_url = self::getDetUrl();
         if ($data_entry_trigger_url !== $det_url) {
+            logIt("DETS ARE DIFFERENT - DET: [$data_entry_trigger_url] / SELF DET: [$det_url]", "DEBUG");
             if ($update) {
                 // Force the update
                 $sql = "update redcap_projects set data_entry_trigger_url = '".prep($det_url)."' where project_id = " . intval($this->project_id) . " LIMIT 1;";
@@ -269,16 +274,11 @@ class AutoNotify {
         // Prepare message
         $email = new Message();
         
-        //xxyjl check the 'to' field
-        //if there are matching square brackets, replace it with the value for the record
-//        logIt("TTILE: $title this is ".$this->record . " and " .$this->event_id ." and " .$this->project_id);
-//        logIt("TO ".$trigger['to'] . " and " .$trigger['subject'] );
-        
-        $email->setTo(Piping::replaceVariablesInLabel($trigger['to'], $this->record, $this->event_id, null, false, null, false));
-        $email->setFrom($trigger['from']);
-        $email->setSubject(Piping::replaceVariablesInLabel($trigger['subject'], $this->record, $this->event_id, array(), false, null, false));
-        $email->setBody(Piping::replaceVariablesInLabel($trigger['body'], $this->record, $this->event_id, array(), false, null, false));
-        
+        $email->setTo(self::pipeThis($trigger['to']));
+        $email->setFrom(self::pipeThis($trigger['from']));
+        $email->setSubject(self::pipeThis($trigger['subject']));
+        $email->setBody(self::pipeThis($trigger['body']));
+
         // Send Email
         if (!$email->send()) {
             error_log('Error sending mail: '.$email->getSendError().' with '.json_encode($email));
@@ -292,13 +292,24 @@ class AutoNotify {
         }
 
         // Add Log Entry
-        $data_values = "==> AutoNotify2 Rule Fired\ntitle,$title\nrecord,{$this->record}\nevent,{$this->redcap_event_name}";
+        $data_values = "==> AutoNotify2 Rule Fired\n".
+            "title,$title\n".
+            "record,{$this->record}\n" .
+            (REDcap::isLongitudinal() ? "event,{$this->redcap_event_name}" : "");
         REDCap::logEvent('AutoNotify2 Alert',$data_values,"",$this->record, $this->event_id);
         return true;
     }
 
+    // A wrapper for piping values...
+    public function pipeThis($input) {
+        $result = Piping::replaceVariablesInLabel($input, $this->record, $this->event_id, null, false, $this->project_id, false);
+        return $result;
+    }
+
     // Go through logs to see if there is a prior alert for this record/event/title
+    // Scope 0 is record/event match, scope 1 is record only
     public function checkForPriorNotification($title, $scope=0) {
+        if (!REDCap::isLongitudinal()) $scope = 1; // Record match only is sufficient
         $sql = "SELECT l.data_values, l.ts
 			FROM redcap_log_event l WHERE 
 		 		l.project_id = {$this->project_id}
@@ -306,14 +317,12 @@ class AutoNotify {
 			AND l.description = 'AutoNotify2 Alert';";
         $q = db_query($sql);
 
-        //logIt("Scope test in " . __FUNCTION__ . json_encode($this), "DEBUG");
-
         while ($row = db_fetch_assoc($q)) {
             $pairs = parseEnum($row['data_values']);
             if (
                 $pairs['title'] == $title &&
                 $pairs['record'] == $this->record &&
-                ( $pairs['event'] == $this->redcap_event_name OR $scope == 1)
+                ( $scope == 1 OR $pairs['event'] == $this->redcap_event_name)
             )
             {
                 $date = substr($row['ts'], 4, 2) . "/" . substr($row['ts'], 6, 2) . "/" . substr($row['ts'], 0, 4);
@@ -376,11 +385,11 @@ class AutoNotify {
                 RCView::a(array('href'=>'javascript:','onclick'=>"removeTrigger('$id')"), RCView::img(array('style'=>'float:right;padding-top:0px;', 'src'=>'cross.png')))
             ).
             RCView::table(array('cellspacing'=>'5', 'class'=>'tbi'),
-                self::renderRow('title-'.$id,'Trigger ID',$title, 'title').
-                self::renderLogicRow($id,'Conditional Logic',$logic, 'logic').
-                self::renderScopeRow($id, 'Evaluate', $scope) .
+                self::renderRow('title-'.$id,'Title',$title, 'title').
+                self::renderLogicRow($id,'Logic',$logic, 'logic').
+                (REDCap::isLongitudinal() ? self::renderScopeRow($id, 'Evaluate', $scope) : "") .
                 self::renderTestRow($id,'Test Logic', $test_record, $test_event, 'test').
-                self::renderEnabledRow($id,'<nobr>Trigger Status</nobr>', $enabled) .
+                self::renderEnabledRow($id,'Status', $enabled) .
             //	self::renderStatusRow();	// Enable or Disable the current trigger
                 self::renderRow('to-'.$id,'To', $to, 'to') .
                 self::renderRow('bcc-'.$id,'Bcc', $bcc, 'bcc') .
@@ -451,7 +460,7 @@ class AutoNotify {
         return $row;
     }
 
-    // Renders a radio that allows selection of eval once per record(1) or record/event (default/0)
+    // Renders a radio that allows selection of eval once per record(1) or record/event (default/0) - only displayed for longitudinal projects
     public function renderScopeRow($id, $label, $value) {
         //error_log('ID:'.$id.' and VALUE:'.$value);
         $perRecordChecked = ($value == 1 ? 'checked' : '');
