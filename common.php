@@ -275,6 +275,7 @@ class AutoNotify {
         $email = new Message();
         
         $email->setTo(self::pipeThis($trigger['to']));
+        $email->setBcc(self::pipeThis($trigger['bcc']));
         $email->setFrom(self::pipeThis($trigger['from']));
         $email->setSubject(self::pipeThis($trigger['subject']));
         $email->setBody(self::pipeThis($trigger['body']));
